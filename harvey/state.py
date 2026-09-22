@@ -374,6 +374,15 @@ MIGRATIONS: list[str] = [
     CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_external
         ON companies(external_id) WHERE external_id != '';
     """,
+
+    # ── v9: track prospect-backfill attempts on known companies ──
+    """
+    -- Without this, a company that gets scraped for contacts and comes up
+    -- empty (no team page, site blocked, etc.) is indistinguishable from one
+    -- never attempted, so the backfill pass would retry the same handful of
+    -- companies forever instead of rotating through the rest.
+    ALTER TABLE companies ADD COLUMN prospects_checked_at TIMESTAMP DEFAULT NULL;
+    """,
 ]
 
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
@@ -1188,13 +1197,21 @@ class StateManager:
                 row = await cursor.fetchone()
                 return row[0] if row else 0
 
-    async def companies_needing_prospects(self, limit: int = 10) -> list[dict]:
-        """Companies with a domain but zero prospects on file.
+    async def companies_needing_prospects(
+        self, limit: int = 10, stale_days: int = 14
+    ) -> list[dict]:
+        """Companies with a domain, zero prospects, and no recent check.
 
         `harvey discover` (and other company-only sources) can add companies
         without ever finding a named contact at them. This is what lets a
         prospecting pass go back and fill that in, instead of only ever
         looking at companies it stumbles into fresh in the same cycle.
+
+        Ordered by ``prospects_checked_at`` (nulls first) rather than
+        recency, so a backfill pass rotates through the whole backlog
+        instead of retrying the same top-N-by-created_at companies every
+        cycle — a company a team page didn't exist for last time is worth
+        another look after ``stale_days``, not a permanent skip.
         """
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
@@ -1203,13 +1220,26 @@ class StateManager:
                    FROM companies c
                    LEFT JOIN prospects p ON p.company_id = c.id
                    WHERE c.domain != ''
+                     AND (c.prospects_checked_at IS NULL
+                          OR c.prospects_checked_at < datetime('now', ?))
                    GROUP BY c.id
                    HAVING COUNT(p.id) = 0
-                   ORDER BY c.created_at DESC
+                   ORDER BY c.prospects_checked_at IS NOT NULL, c.prospects_checked_at
                    LIMIT ?""",
-                (int(limit),),
+                (f"-{int(stale_days)} days", int(limit)),
             ) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
+
+    async def mark_prospects_checked(self, company_id: str):
+        """Record that a prospect-backfill pass looked at this company,
+        whether or not it found anyone — advances the rotation regardless."""
+        async with self._connect() as db:
+            await db.execute(
+                """UPDATE companies SET prospects_checked_at = CURRENT_TIMESTAMP,
+                       updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                (company_id,),
+            )
+            await db.commit()
 
     # ── Run log (what ran, when, what it produced and cost) ──
 

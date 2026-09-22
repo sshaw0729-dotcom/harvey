@@ -485,6 +485,8 @@ class Scout:
         if not companies:
             return 0
 
+        logger.info(f"Scout: Backfilling contacts for {len(companies)} known companies...")
+
         count = 0
         for company in companies:
             domain = (company.get("domain") or "").strip()
@@ -498,6 +500,14 @@ class Scout:
                 industry=company.get("industry") or default_industry,
                 source="known_company_backfill",
             )
+
+            # Mark it checked regardless of outcome, so a company with no
+            # scrapable team page rotates out instead of being retried
+            # every cycle forever.
+            try:
+                await self.state.mark_prospects_checked(company["id"])
+            except Exception as e:
+                logger.debug(f"mark_prospects_checked failed for {domain}: {e}")
 
             for prospect in contacts:
                 await self.state.add_prospect(prospect)
