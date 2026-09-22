@@ -259,30 +259,32 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
 
 def _needs_setup() -> bool:
     """Check if Harvey needs first-time setup."""
-    from pathlib import Path
     from harvey.paths import PROJECT_ROOT
-    project_root = PROJECT_ROOT
-    env_file = project_root / ".env"
-    config_file = project_root / "harvey.yaml"
+    from harvey.config import _find_config_file, ConfigFileNotFoundError
+
+    env_file = PROJECT_ROOT / ".env"
 
     # If .env doesn't exist, definitely needs setup
     if not env_file.exists():
         return True
 
-    # If config still has placeholder values, needs setup
-    if config_file.exists():
-        try:
-            with open(config_file) as f:
-                import yaml
-                config = yaml.safe_load(f)
-            if not isinstance(config, dict):
-                return True
-            company = (config.get("persona") or {}).get("company", "")
-            if company in ("Your Company", ""):
-                return True
-        except Exception:
+    # harvey.local.yaml wins over the tracked harvey.yaml template, same
+    # resolution order the real config loader uses (see config.py).
+    try:
+        config_file = _find_config_file()
+    except ConfigFileNotFoundError:
+        return True
+
+    try:
+        with open(config_file) as f:
+            import yaml
+            config = yaml.safe_load(f)
+        if not isinstance(config, dict):
             return True
-    else:
+        company = (config.get("persona") or {}).get("company", "")
+        if company in ("Your Company", ""):
+            return True
+    except Exception:
         return True
 
     return False
