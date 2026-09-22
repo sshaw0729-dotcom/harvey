@@ -124,6 +124,12 @@ class Scout:
 
         # Each strategy is isolated so one failing does not abort the cycle.
         strategies = []
+        # Backfill first: companies already on file (e.g. from `harvey
+        # discover`) but with zero prospects. Scrapes each company's own
+        # site directly, so it costs no search-query budget and isn't at
+        # the mercy of Serper/Bing flakiness — cheapest, most reliable win
+        # available before spending any queries.
+        strategies.append(("known_companies", self._prospect_via_known_companies))
         if self.config.channels.linkedin.enabled and self.env.linkedin_email:
             strategies.append(("linkedin", self._prospect_via_linkedin))
         # Job boards first: hiring is the strongest intent signal, and the
@@ -451,6 +457,59 @@ class Scout:
         if results:
             logger.debug(f"Google returned {len(results)} results")
         return results[:MAX_RESULTS_PER_QUERY]
+
+    # ── Strategy 0: Known companies with zero prospects ──
+
+    async def _prospect_via_known_companies(self) -> int:
+        """Scrape team pages for companies already on file with no contacts.
+
+        Company-only sources (`harvey discover`, directory scraping, etc.)
+        add rows to `companies` without ever finding a named person there.
+        Left alone, those companies never get a contacts pass — every other
+        strategy here skips a domain the moment it recognizes it, since
+        they're built to discover companies and people together, not to
+        revisit one after the other. This strategy is the backfill.
+        """
+        default_industry = (
+            self.config.icp.industries[0] if self.config.icp.industries else ""
+        )
+
+        try:
+            companies = await self.state.companies_needing_prospects(
+                limit=MAX_COMPANIES_PER_CYCLE
+            )
+        except Exception as e:
+            logger.debug(f"companies_needing_prospects failed: {e}")
+            return 0
+
+        if not companies:
+            return 0
+
+        count = 0
+        for company in companies:
+            domain = (company.get("domain") or "").strip()
+            if not domain:
+                continue
+
+            contacts = await self._contacts_from_company(
+                company_id=company["id"],
+                domain=domain,
+                company_name=company.get("name") or self._domain_to_name(domain),
+                industry=company.get("industry") or default_industry,
+                source="known_company_backfill",
+            )
+
+            for prospect in contacts:
+                await self.state.add_prospect(prospect)
+                count += 1
+                logger.info(
+                    f"Scout: Added {prospect.full_name()} ({prospect.title}) "
+                    f"at {prospect.company} [backfill]"
+                )
+                if count >= MAX_PROSPECTS_PER_CYCLE:
+                    return count
+
+        return count
 
     # ── Strategy 1: LinkedIn ──
 

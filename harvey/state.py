@@ -1188,6 +1188,29 @@ class StateManager:
                 row = await cursor.fetchone()
                 return row[0] if row else 0
 
+    async def companies_needing_prospects(self, limit: int = 10) -> list[dict]:
+        """Companies with a domain but zero prospects on file.
+
+        `harvey discover` (and other company-only sources) can add companies
+        without ever finding a named contact at them. This is what lets a
+        prospecting pass go back and fill that in, instead of only ever
+        looking at companies it stumbles into fresh in the same cycle.
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT c.id, c.name, c.domain, c.industry
+                   FROM companies c
+                   LEFT JOIN prospects p ON p.company_id = c.id
+                   WHERE c.domain != ''
+                   GROUP BY c.id
+                   HAVING COUNT(p.id) = 0
+                   ORDER BY c.created_at DESC
+                   LIMIT ?""",
+                (int(limit),),
+            ) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
     # ── Run log (what ran, when, what it produced and cost) ──
 
     async def start_run(
