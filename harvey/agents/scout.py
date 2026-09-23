@@ -1140,13 +1140,34 @@ Respond ONLY with the JSON array."""
         )
         return await self.state.add_company(company)
 
+    async def _resolve_base_url(
+        self, domain: str, retries: int = 1
+    ) -> tuple[str, httpx.Response | None]:
+        """Return (working base url, its response) for the first scheme/www
+        variant that actually answers, or ("", None) if none do.
+
+        A bare `https://{domain}` guess marks plenty of live, real small
+        businesses "unreachable" simply because they never got a TLS cert,
+        or only answer on www — costing us the whole company or team-page
+        scrape for a site that was never actually down.
+        """
+        for base in (
+            f"https://{domain}", f"https://www.{domain}",
+            f"http://{domain}", f"http://www.{domain}",
+        ):
+            resp = await self._fetch(base, timeout=SCRAPE_TIMEOUT, retries=retries)
+            if resp is not None:
+                return base, resp
+        return "", None
+
     async def _scrape_company_info(self, domain: str) -> dict:
         """Scrape a company's homepage for basic info. Pure Python."""
         info = {"name": "", "description": "", "website": f"https://{domain}"}
 
-        resp = await self._fetch(f"https://{domain}", timeout=SCRAPE_TIMEOUT, retries=2)
+        base, resp = await self._resolve_base_url(domain, retries=2)
         if resp is None:
             return info
+        info["website"] = base
 
         # Keep the raw HTML so signal detection reuses this fetch.
         info["_homepage_html"] = resp.text
@@ -1189,8 +1210,12 @@ Respond ONLY with the JSON array."""
                       "/leadership", "/about/team", "/company/team", "/staff"]
         members = []
 
+        base, _ = await self._resolve_base_url(domain)
+        if not base:
+            return members
+
         for path in team_paths:
-            url = f"https://{domain}{path}"
+            url = f"{base}{path}"
             resp = await self._fetch(url, timeout=SCRAPE_TIMEOUT, retries=1)
             if resp is None:
                 continue
