@@ -496,6 +496,13 @@ Return as JSON:
   "disqualifiers": ["signals that someone is NOT a good fit 1", "disqualifier 2"]
 }}
 
+For any city in "geography", always include the state/province and country if
+the name could plausibly refer to more than one place — write "Solon, Ohio"
+not "Solon" (there's also a Solon in France), "Springfield, Illinois" not
+"Springfield" (30+ US cities share that name). These strings get geocoded
+automatically for local-business discovery, and an unqualified name silently
+resolves to the wrong place on Earth instead of failing loudly.
+
 Be specific — don't guess generically. Base this on what the website actually says about their customers."""
 
         result = await self.brain.think_json(prompt, session_id="harvey-trainer")
