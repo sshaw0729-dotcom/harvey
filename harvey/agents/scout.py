@@ -59,6 +59,14 @@ MAX_RESULTS_PER_QUERY = 20
 MAX_COMPANIES_PER_CYCLE = 10
 MAX_PROSPECTS_PER_CYCLE = 25
 
+# Hunter's free tier is 25 domain-searches/month total, and each call costs
+# a credit regardless of how many people it returns — a heartbeat running
+# every 15 minutes would blow through that in under an hour uncapped, so
+# usage is tracked explicitly (see _prospect_via_hunter) rather than trusted
+# to fail gracefully once exhausted.
+HUNTER_MONTHLY_CAP = 25
+HUNTER_DOMAINS_PER_CYCLE = 1
+
 # Rotate a small pool of realistic desktop user-agents. Scrapers that always
 # send one UA are trivially fingerprinted and blocked.
 USER_AGENTS = [
@@ -124,7 +132,12 @@ class Scout:
 
         # Each strategy is isolated so one failing does not abort the cycle.
         strategies = []
-        # Backfill first: companies already on file (e.g. from `harvey
+        # Hunter first, if configured: real named people with a real
+        # verification verdict beats a scrape guess, but the free tier's
+        # 25/month cap means it only ever covers a handful of companies —
+        # self-skips once the monthly quota (tracked in settings) is spent.
+        strategies.append(("hunter", self._prospect_via_hunter))
+        # Backfill next: companies already on file (e.g. from `harvey
         # discover`) but with zero prospects. Scrapes each company's own
         # site directly, so it costs no search-query budget and isn't at
         # the mercy of Serper/Bing flakiness — cheapest, most reliable win
@@ -457,6 +470,115 @@ class Scout:
         if results:
             logger.debug(f"Google returned {len(results)} results")
         return results[:MAX_RESULTS_PER_QUERY]
+
+    # ── Strategy -1: Hunter named contacts (quota-gated) ──
+
+    _HUNTER_STATUS_MAP = {
+        "valid": "verified",
+        "accept_all": "risky",
+        "invalid": "invalid",
+        "disposable": "invalid",
+    }
+
+    async def _prospect_via_hunter(self) -> int:
+        """Pull Hunter's actual named-people data for companies with zero
+        prospects — real name/title/email/verification, not a scrape guess.
+
+        Hunter's free tier is 25 domain-searches/month for the whole
+        account, so this draws from the same rotating pool as the team-page
+        backfill but at a much smaller, explicitly quota-tracked pace.
+        """
+        api_key = getattr(self.env, "hunter_api_key", "") or ""
+        if not api_key:
+            return 0
+
+        month_key = datetime.now(timezone.utc).strftime("%Y-%m")
+        setting_key = f"hunter_domain_search_count:{month_key}"
+        try:
+            used = int(await self.state.get_setting(setting_key, "0") or "0")
+        except ValueError:
+            used = 0
+        remaining = HUNTER_MONTHLY_CAP - used
+        if remaining <= 0:
+            return 0
+
+        batch_size = min(remaining, HUNTER_DOMAINS_PER_CYCLE)
+        try:
+            companies = await self.state.companies_needing_prospects(limit=batch_size)
+        except Exception as e:
+            logger.debug(f"companies_needing_prospects failed: {e}")
+            return 0
+        if not companies:
+            return 0
+
+        from harvey.integrations.email_finder import hunter_domain_people
+
+        default_industry = (
+            self.config.icp.industries[0] if self.config.icp.industries else ""
+        )
+        count = 0
+        for company in companies:
+            domain = (company.get("domain") or "").strip()
+            if not domain:
+                continue
+
+            people = await hunter_domain_people(domain, api_key)
+            used += 1
+            try:
+                await self.state.set_setting(setting_key, str(used))
+            except Exception as e:
+                logger.debug(f"set_setting failed for {setting_key}: {e}")
+            try:
+                await self.state.mark_prospects_checked(company["id"])
+            except Exception as e:
+                logger.debug(f"mark_prospects_checked failed for {domain}: {e}")
+
+            for person in people or []:
+                if not isinstance(person, dict):
+                    continue
+                title = person.get("position") or ""
+                if not self._title_matches_icp(title):
+                    continue
+
+                verification = person.get("verification") or {}
+                hunter_status = (verification.get("status") or "").lower()
+                email_status = self._HUNTER_STATUS_MAP.get(hunter_status, "guess")
+
+                prospect = Prospect(
+                    first_name=person.get("first_name") or "",
+                    last_name=person.get("last_name") or "",
+                    email=person.get("value") or "",
+                    email_status=email_status,
+                    email_verified=(email_status == "verified"),
+                    linkedin_url=person.get("linkedin") or "",
+                    company=company.get("name") or self._domain_to_name(domain),
+                    company_id=company["id"],
+                    title=title,
+                    seniority=person.get("seniority") or self._infer_seniority(title),
+                    industry=company.get("industry") or default_industry,
+                    source="hunter_domain_search",
+                    source_url=f"https://{domain}",
+                )
+
+                if not prospect.is_valid():
+                    continue
+                if await self._is_duplicate_prospect(prospect):
+                    continue
+
+                await self.state.add_prospect(prospect)
+                self._remember_prospect(prospect)
+                count += 1
+                logger.info(
+                    f"Scout: Added {prospect.full_name()} ({prospect.title}) "
+                    f"at {prospect.company} [hunter]"
+                )
+                if count >= MAX_PROSPECTS_PER_CYCLE:
+                    return count
+
+            if used >= HUNTER_MONTHLY_CAP:
+                break
+
+        return count
 
     # ── Strategy 0: Known companies with zero prospects ──
 

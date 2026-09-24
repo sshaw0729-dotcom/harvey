@@ -230,6 +230,37 @@ def _hunter_api_key() -> str:
     return os.getenv("HUNTER_API_KEY", "").strip()
 
 
+async def hunter_domain_people(
+    domain: str, api_key: str, limit: int = 10
+) -> Optional[list[dict]]:
+    """Hunter's domain-search doesn't just give a pattern — it lists real
+    named people it already has on file for the domain (name, title, email,
+    and its own verification verdict). Returns the raw ``emails`` list, or
+    None on any failure (network, non-200, bad JSON, or no data).
+
+    Costs one domain-search credit per call regardless of ``limit`` — the
+    free tier is 25/month, so callers must budget calls, not rely on this
+    failing gracefully to protect the quota.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
+            resp = await client.get(
+                "https://api.hunter.io/v2/domain-search",
+                params={"domain": domain, "api_key": api_key, "limit": limit},
+            )
+    except httpx.HTTPError as e:
+        logger.debug(f"Hunter domain-search failed for {domain}: {e}")
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = (resp.json() or {}).get("data") or {}
+    except ValueError:
+        return None
+    emails = data.get("emails")
+    return emails if isinstance(emails, list) else None
+
+
 async def derive_pattern(
     domain: str,
     known_emails: Optional[list[tuple[str, str, str]]] = None,
