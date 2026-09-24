@@ -383,6 +383,26 @@ MIGRATIONS: list[str] = [
     -- companies forever instead of rotating through the rest.
     ALTER TABLE companies ADD COLUMN prospects_checked_at TIMESTAMP DEFAULT NULL;
     """,
+
+    # ── v10: same fix, for the profile collector ──
+    """
+    -- The profile collector only ever wrote an observation on a SUCCESSFUL
+    -- fetch; an unreachable site produced zero rows despite the code's own
+    -- comment claiming "a failure IS an observation." Staleness was judged
+    -- purely from observations, so an unreachable company never looked
+    -- checked and the same handful got retried every cycle forever.
+    -- Backfill from existing observations so already-profiled companies
+    -- aren't treated as unchecked just because this column is new.
+    ALTER TABLE companies ADD COLUMN profile_checked_at TIMESTAMP DEFAULT NULL;
+
+    UPDATE companies SET profile_checked_at = (
+        SELECT MAX(observed_at) FROM observations
+        WHERE observations.company_id = companies.id
+          AND observations.collector = 'profile'
+    ) WHERE id IN (
+        SELECT DISTINCT company_id FROM observations WHERE collector = 'profile'
+    );
+    """,
 ]
 
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
@@ -1154,10 +1174,12 @@ class StateManager:
     ) -> list[dict]:
         """Companies a profile run should visit next.
 
-        Never profiled, or last profiled longer ago than ``stale_days``. The
-        staleness window is what makes re-observation a time series rather
-        than a duplicate: "they dropped their agency last quarter" is only
-        visible if you look again.
+        Never checked, or last checked longer ago than ``stale_days`` —
+        ordered nulls-first so it rotates through the whole backlog instead
+        of retrying the same top-N-by-created_at companies every cycle.
+        ``profile_checked_at`` is set on every attempt regardless of outcome
+        (see ProfileCollector.run), so an unreachable site still counts as
+        checked and rotates out instead of being retried forever.
 
         Businesses with no domain are excluded — there is no site to read.
         They are not a failure, they are the NO_WEBSITE cohort.
@@ -1167,15 +1189,10 @@ class StateManager:
             async with db.execute(
                 """SELECT c.id, c.name, c.domain
                    FROM companies c
-                   LEFT JOIN (
-                       SELECT company_id, MAX(observed_at) AS last_seen
-                       FROM observations WHERE collector = 'profile'
-                       GROUP BY company_id
-                   ) p ON p.company_id = c.id
                    WHERE c.domain != ''
-                     AND (p.last_seen IS NULL
-                          OR p.last_seen < datetime('now', ?))
-                   ORDER BY c.created_at DESC
+                     AND (c.profile_checked_at IS NULL
+                          OR c.profile_checked_at < datetime('now', ?))
+                   ORDER BY c.profile_checked_at IS NOT NULL, c.profile_checked_at
                    LIMIT ?""",
                 (f"-{int(stale_days)} days", int(limit)),
             ) as cursor:
@@ -1185,17 +1202,24 @@ class StateManager:
         async with self._connect() as db:
             async with db.execute(
                 """SELECT COUNT(*) FROM companies c
-                   LEFT JOIN (
-                       SELECT company_id, MAX(observed_at) AS last_seen
-                       FROM observations WHERE collector = 'profile'
-                       GROUP BY company_id
-                   ) p ON p.company_id = c.id
                    WHERE c.domain != ''
-                     AND (p.last_seen IS NULL OR p.last_seen < datetime('now', ?))""",
+                     AND (c.profile_checked_at IS NULL
+                          OR c.profile_checked_at < datetime('now', ?))""",
                 (f"-{int(stale_days)} days",),
             ) as cursor:
                 row = await cursor.fetchone()
                 return row[0] if row else 0
+
+    async def mark_company_profiled(self, company_id: str):
+        """Record that a profile pass looked at this company, whether or
+        not it was reachable — advances the rotation regardless."""
+        async with self._connect() as db:
+            await db.execute(
+                """UPDATE companies SET profile_checked_at = CURRENT_TIMESTAMP,
+                       updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                (company_id,),
+            )
+            await db.commit()
 
     async def companies_needing_prospects(
         self, limit: int = 10, stale_days: int = 14

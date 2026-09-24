@@ -455,6 +455,12 @@ class ProfileCollector:
 
         return obs
 
+    async def _mark_checked(self, company_id: str):
+        try:
+            await self.state.mark_company_profiled(company_id)
+        except Exception as e:
+            logger.debug(f"mark_company_profiled failed for {company_id}: {e}")
+
     async def run(self, companies: list[dict], run_id: str = "") -> int:
         """Profile many businesses, flushing observations after each one.
 
@@ -470,7 +476,12 @@ class ProfileCollector:
                 obs = await self.profile_company(company["id"], domain)
             except Exception as e:
                 logger.warning(f"profile failed for {domain}: {e}")
+                await self._mark_checked(company["id"])
                 continue
+            # Marked regardless of outcome — an unreachable site still counts
+            # as checked, or the same handful gets retried every cycle
+            # forever instead of rotating through the rest of the backlog.
+            await self._mark_checked(company["id"])
             if obs:
                 total += await self.state.add_observations(obs, run_id=run_id)
                 logger.info(f"profile: {domain} → {len(obs)} observation(s)")
