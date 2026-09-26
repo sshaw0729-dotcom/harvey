@@ -32,6 +32,12 @@ ERROR_BACKOFF_CAP = 900
 # knowing it's dead — found in production after exactly that happened.
 CYCLE_TIMEOUT_SECONDS = 600
 
+# Cap on a single quiet-hours sleep chunk. See the quiet-hours block in
+# heartbeat() for why this exists — a system sleep/wake cycle during one
+# multi-hour asyncio.wait_for left Harvey silently stalled well past when
+# quiet hours actually ended.
+QUIET_HOURS_POLL_SECONDS = 300
+
 
 def in_quiet_hours(config: HarveyConfig) -> bool:
     """Check if we're currently in quiet hours."""
@@ -158,7 +164,20 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             if in_quiet_hours(config):
                 sleep_for = seconds_until_quiet_hours_end(config)
                 logger.info(f"Quiet hours. Sleeping for {sleep_for // 60} minutes.")
-                if await _interruptible_sleep(sleep_for, stop_event):
+                # Sleep in short polled chunks rather than one multi-hour
+                # wait: found in production that a system sleep/wake cycle
+                # during a long asyncio.wait_for left the process silently
+                # stalled for the rest of the quiet-hours window (11+ hours
+                # in one case) instead of resuming once the Mac woke up.
+                # Re-checking wall-clock quiet hours every few minutes
+                # bounds the worst case to QUIET_HOURS_POLL_SECONDS instead
+                # of however long the missed timer would have run.
+                shutting_down = False
+                while in_quiet_hours(config):
+                    if await _interruptible_sleep(QUIET_HOURS_POLL_SECONDS, stop_event):
+                        shutting_down = True
+                        break
+                if shutting_down:
                     break
                 continue
 
