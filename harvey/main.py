@@ -24,6 +24,14 @@ logger = logging.getLogger("harvey")
 ERROR_BACKOFF_BASE = 60
 ERROR_BACKOFF_CAP = 900
 
+# Hard ceiling on one cycle's parallel agents. return_exceptions=True on
+# gather() only isolates a task that raises — a task that hangs (a socket or
+# lock that never resolves) blocks gather() forever, taking the whole
+# heartbeat loop down silently with it. This is the only thing standing
+# between one stuck agent and Harvey freezing for hours with no agent
+# knowing it's dead — found in production after exactly that happened.
+CYCLE_TIMEOUT_SECONDS = 600
+
 
 def in_quiet_hours(config: HarveyConfig) -> bool:
     """Check if we're currently in quiet hours."""
@@ -212,11 +220,21 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             if len(tasks) > 1:
                 logger.info(f"Running {len(tasks)} agents in parallel: {[t[0] for t in tasks]}")
 
-            # Run all tasks, catch errors per-task so one bad agent
-            # never takes down the cycle
-            results = await asyncio.gather(
-                *[t[1] for t in tasks], return_exceptions=True
-            )
+            # Run all tasks, catch errors per-task so one bad agent never
+            # takes down the cycle — and bound the whole batch so one
+            # HUNG agent (no exception, just never returns) can't either.
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*[t[1] for t in tasks], return_exceptions=True),
+                    timeout=CYCLE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"Cycle timed out after {CYCLE_TIMEOUT_SECONDS}s with "
+                    f"{[t[0] for t in tasks]} still running — cancelled, "
+                    "moving on to the next heartbeat instead of hanging forever."
+                )
+                results = []
             for (name, _), result in zip(tasks, results):
                 if isinstance(result, asyncio.CancelledError):
                     raise result
